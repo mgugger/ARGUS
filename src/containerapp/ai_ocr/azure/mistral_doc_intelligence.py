@@ -6,7 +6,7 @@ import base64
 import json
 import logging
 import httpx
-from typing import Optional
+from typing import Optional, Union
 from ai_ocr.azure.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,97 @@ def get_mistral_doc_ai_client(cosmos_config_container=None):
     }
 
 
-def get_ocr_results(file_path: str, cosmos_config_container=None, json_schema: Optional[dict] = None) -> str:
+def extract_bboxes_from_mistral_response(result: dict) -> dict:
+    """
+    Extract bounding box data from Mistral Document AI response.
+    
+    Mistral returns bboxes in a different format than Azure Document Intelligence.
+    This function normalizes them to match the ARGUS polygon format.
+    
+    Args:
+        result: The raw JSON response from Mistral Document AI
+        
+    Returns:
+        Dictionary with normalized polygon data
+    """
+    words = []
+    lines = []
+    
+    if "pages" not in result or not isinstance(result["pages"], list):
+        return {"words": words, "lines": lines, "keyValuePairs": [], "paragraphs": []}
+    
+    for page_idx, page in enumerate(result["pages"]):
+        page_number = page_idx + 1
+        
+        # Extract words with bboxes if available
+        if "words" in page and isinstance(page["words"], list):
+            for word in page["words"]:
+                bbox = word.get("bbox", word.get("bounding_box", []))
+                words.append({
+                    "content": word.get("text", word.get("content", "")),
+                    "confidence": word.get("confidence"),
+                    "pageNumber": page_number,
+                    "points": normalize_mistral_bbox(bbox)
+                })
+        
+        # Extract lines with bboxes if available
+        if "lines" in page and isinstance(page["lines"], list):
+            for line in page["lines"]:
+                bbox = line.get("bbox", line.get("bounding_box", []))
+                lines.append({
+                    "content": line.get("text", line.get("content", "")),
+                    "pageNumber": page_number,
+                    "points": normalize_mistral_bbox(bbox)
+                })
+        
+        # Some Mistral responses have blocks instead of lines
+        if "blocks" in page and isinstance(page["blocks"], list):
+            for block in page["blocks"]:
+                bbox = block.get("bbox", block.get("bounding_box", []))
+                if bbox:
+                    lines.append({
+                        "content": block.get("text", block.get("content", "")),
+                        "pageNumber": page_number,
+                        "points": normalize_mistral_bbox(bbox)
+                    })
+    
+    return {
+        "words": words,
+        "lines": lines,
+        "keyValuePairs": [],  # Mistral doesn't provide KV pairs like Azure Doc Intel
+        "paragraphs": []
+    }
+
+
+def normalize_mistral_bbox(bbox: list) -> list:
+    """
+    Normalize Mistral bbox format to ARGUS polygon format.
+    
+    Mistral may return bbox as [x, y, width, height] or [x1, y1, x2, y2, x3, y3, x4, y4].
+    We normalize to the 8-point polygon format.
+    
+    Args:
+        bbox: Bounding box from Mistral
+        
+    Returns:
+        List of 8 points [x1, y1, x2, y2, x3, y3, x4, y4]
+    """
+    if not bbox:
+        return []
+    
+    if len(bbox) == 4:
+        # Assume [x, y, width, height] format - convert to 4 corner points
+        x, y, w, h = bbox
+        return [x, y, x + w, y, x + w, y + h, x, y + h]
+    elif len(bbox) == 8:
+        # Already in polygon format
+        return bbox
+    else:
+        # Unknown format, return as-is
+        return bbox
+
+
+def get_ocr_results(file_path: str, cosmos_config_container=None, json_schema: Optional[dict] = None, include_polygons: bool = False) -> Union[str, dict]:
     """
     Extract text from document using Mistral Document AI.
     
@@ -84,14 +174,17 @@ def get_ocr_results(file_path: str, cosmos_config_container=None, json_schema: O
         file_path: Path to the file to process
         cosmos_config_container: Optional Cosmos config container (kept for compatibility)
         json_schema: Optional JSON schema for structured extraction with bbox annotation
+        include_polygons: If True, return full result with polygon data; if False, return only text content
         
     Returns:
-        Extracted text content from the document
+        If include_polygons is False: str - OCR text content
+        If include_polygons is True: dict - Full result with content and polygon data
     """
     import threading
     thread_id = threading.current_thread().ident
     
     logger.info(f"[Thread-{thread_id}] Starting Mistral Document AI OCR for: {file_path}")
+    logger.info(f"[Thread-{thread_id}] Include polygons: {include_polygons}")
     
     # Get Mistral configuration
     mistral_config = get_mistral_doc_ai_client(cosmos_config_container)
@@ -113,17 +206,21 @@ def get_ocr_results(file_path: str, cosmos_config_container=None, json_schema: O
         "include_image_base64": False  # We don't need images back, just text
     }
     
-    # If JSON schema is provided, add bbox annotation format for structured extraction
-    if json_schema:
-        logger.info(f"[Thread-{thread_id}] Adding bbox annotation format with schema")
-        payload["bbox_annotation_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "schema": json_schema,
-                "name": "document_annotation",
-                "strict": True
+    # If JSON schema is provided or include_polygons is True, add bbox annotation format
+    if json_schema or include_polygons:
+        logger.info(f"[Thread-{thread_id}] Adding bbox annotation format" + (" with schema" if json_schema else ""))
+        if json_schema:
+            payload["bbox_annotation_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": json_schema,
+                    "name": "document_annotation",
+                    "strict": True
+                }
             }
-        }
+        else:
+            # Request bboxes without schema constraint
+            payload["include_bboxes"] = True
     
     # Make request to Mistral API
     headers = {
@@ -166,7 +263,21 @@ def get_ocr_results(file_path: str, cosmos_config_container=None, json_schema: O
                 ocr_text = ""
             
             logger.info(f"[Thread-{thread_id}] Mistral Document AI OCR completed, {len(ocr_text)} characters")
-            return ocr_text
+            
+            if not include_polygons:
+                return ocr_text
+            
+            # Extract polygon data from Mistral response
+            logger.info(f"[Thread-{thread_id}] Extracting polygon data from Mistral response")
+            polygon_data = extract_bboxes_from_mistral_response(result)
+            
+            return {
+                "content": ocr_text,
+                "words": polygon_data["words"],
+                "lines": polygon_data["lines"],
+                "keyValuePairs": polygon_data["keyValuePairs"],
+                "paragraphs": polygon_data["paragraphs"]
+            }
             
     except httpx.HTTPStatusError as e:
         logger.error(f"[Thread-{thread_id}] Mistral API HTTP error: {e.response.status_code}")

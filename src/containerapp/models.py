@@ -1,8 +1,60 @@
 """
 Data models for the ARGUS Container App
 """
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional, Union
+from pydantic import BaseModel, Field
 
+
+# ============================================================================
+# Bounding Polygon Models for Document Intelligence Integration
+# ============================================================================
+
+class BoundingPolygon(BaseModel):
+    """
+    Represents a bounding polygon for a text element on a document page.
+    Points are stored as a flat list: [x1, y1, x2, y2, x3, y3, x4, y4]
+    representing the four corners of the bounding quadrilateral.
+    """
+    points: List[float] = Field(default_factory=list, description="Polygon points as [x1, y1, x2, y2, ...]")
+    pageNumber: int = Field(default=1, description="1-indexed page number where the element appears")
+
+
+class ExtractedFieldWithLocation(BaseModel):
+    """
+    Represents an extracted field value with optional bounding polygon information.
+    Used when include_polygons=True in extraction requests.
+    """
+    value: Any = Field(description="The extracted field value")
+    boundingPolygons: List[BoundingPolygon] = Field(
+        default_factory=list, 
+        description="List of bounding polygons where this value appears (can be multiple for repeated values)"
+    )
+    confidence: Optional[float] = Field(default=None, description="Confidence score from Document Intelligence")
+    source: str = Field(default="gpt", description="Source of the value: 'doc_intelligence_kv', 'fuzzy_match', or 'gpt'")
+
+
+class OCRPolygonData(BaseModel):
+    """
+    Stores raw polygon data extracted from Document Intelligence for correlation.
+    """
+    content: str = Field(default="", description="Full OCR text content")
+    words: List[Dict[str, Any]] = Field(default_factory=list, description="Words with polygons")
+    lines: List[Dict[str, Any]] = Field(default_factory=list, description="Lines with polygons")
+    keyValuePairs: List[Dict[str, Any]] = Field(default_factory=list, description="Key-value pairs with polygons")
+    paragraphs: List[Dict[str, Any]] = Field(default_factory=list, description="Paragraphs with polygons")
+
+
+class ExtractionRequest(BaseModel):
+    """
+    Request model for document extraction with optional polygon support.
+    """
+    include_polygons: bool = Field(default=False, description="Whether to include bounding polygons in output")
+    fuzzy_match_threshold: float = Field(default=0.90, description="Threshold for fuzzy string matching (0.0-1.0)")
+
+
+# ============================================================================
+# Event Grid and Blob Models
+# ============================================================================
 
 class EventGridEvent:
     """Event Grid event model"""

@@ -24,11 +24,39 @@ from ai_ocr.process import (
     run_ocr_processing, run_gpt_extraction, run_gpt_evaluation, run_gpt_summary,
     prepare_images, initialize_document, update_state, 
     write_blob_to_temp_file, fetch_model_prompt_and_schema, 
-    split_pdf_into_subsets
+    split_pdf_into_subsets, run_polygon_enrichment
 )
 from ai_ocr.model import Config
 
 logger = logging.getLogger(__name__)
+
+
+def merge_polygon_data(polygon_data_list: list) -> dict:
+    """
+    Merge polygon data from multiple document chunks into a single structure.
+    
+    Args:
+        polygon_data_list: List of polygon data dictionaries from each chunk
+        
+    Returns:
+        Merged polygon data dictionary
+    """
+    merged = {
+        'words': [],
+        'lines': [],
+        'keyValuePairs': [],
+        'paragraphs': []
+    }
+    
+    for chunk_data in polygon_data_list:
+        if not chunk_data:
+            continue
+        merged['words'].extend(chunk_data.get('words', []))
+        merged['lines'].extend(chunk_data.get('lines', []))
+        merged['keyValuePairs'].extend(chunk_data.get('keyValuePairs', []))
+        merged['paragraphs'].extend(chunk_data.get('paragraphs', []))
+    
+    return merged
 
 
 def create_blob_input_stream(blob_url: str) -> BlobInputStream:
@@ -279,13 +307,20 @@ def process_blob(blob_input_stream: BlobInputStream, data_container):
             "include_ocr": True,
             "include_images": True,
             "enable_summary": True,
-            "enable_evaluation": True
+            "enable_evaluation": True,
+            "include_polygons": False,
+            "fuzzy_match_threshold": 90.0
         })
+        
+        # Get polygon options
+        include_polygons = processing_options.get('include_polygons', False)
+        fuzzy_match_threshold = processing_options.get('fuzzy_match_threshold', 90.0)
         
         logger.info(f"Processing options: OCR={processing_options.get('include_ocr', True)}, "
                    f"Images={processing_options.get('include_images', True)}, "
                    f"Summary={processing_options.get('enable_summary', True)}, "
-                   f"Evaluation={processing_options.get('enable_evaluation', True)}")
+                   f"Evaluation={processing_options.get('enable_evaluation', True)}, "
+                   f"Polygons={include_polygons} (threshold={fuzzy_match_threshold}%)")
         
         max_pages_per_chunk = document['model_input'].get('max_pages_per_chunk', 10)
         
@@ -305,18 +340,40 @@ def process_blob(blob_input_stream: BlobInputStream, data_container):
 
         # Step 1: Run OCR for all files (conditional - only if OCR text will be used)
         ocr_results = []
+        ocr_polygon_data_list = []  # Store polygon data when include_polygons is True
         total_ocr_time = 0
         
         if processing_options.get('include_ocr', True):
-            logger.info(f"Starting OCR processing for {len(file_paths)} chunks")
+            logger.info(f"Starting OCR processing for {len(file_paths)} chunks (include_polygons={include_polygons})")
             for i, file_path in enumerate(file_paths):
                 logger.info(f"Processing OCR for chunk {i+1}/{len(file_paths)}")
-                ocr_result, ocr_time = run_ocr_processing(file_path, document, data_container, None, update_state=False)
-                ocr_results.append(ocr_result)
+                ocr_result, ocr_time = run_ocr_processing(
+                    file_path, document, data_container, None, 
+                    update_state=False, include_polygons=include_polygons
+                )
+                
+                # Handle polygon data if enabled
+                if include_polygons and isinstance(ocr_result, dict):
+                    ocr_results.append(ocr_result.get('content', ''))
+                    ocr_polygon_data_list.append({
+                        'words': ocr_result.get('words', []),
+                        'lines': ocr_result.get('lines', []),
+                        'keyValuePairs': ocr_result.get('keyValuePairs', []),
+                        'paragraphs': ocr_result.get('paragraphs', [])
+                    })
+                else:
+                    ocr_results.append(ocr_result)
+                    ocr_polygon_data_list.append({})
+                    
                 total_ocr_time += ocr_time
                 
             processing_times['ocr_processing_time'] = total_ocr_time
             document['extracted_data']['ocr_output'] = '\n'.join(str(result) for result in ocr_results)
+            
+            # Store polygon data if enabled
+            if include_polygons and ocr_polygon_data_list:
+                document['extracted_data']['ocr_polygon_data'] = merge_polygon_data(ocr_polygon_data_list)
+            
             update_state(document, data_container, 'ocr_completed', True, total_ocr_time)
             data_container.upsert_item(document)
             logger.info(f"Completed OCR processing for all chunks in {total_ocr_time:.2f}s")
@@ -376,6 +433,45 @@ def process_blob(blob_input_stream: BlobInputStream, data_container):
             
         document['extracted_data']['gpt_extraction_output'] = structured_extraction
         update_state(document, data_container, 'gpt_extraction_completed', True, total_extraction_time)
+        data_container.upsert_item(document)
+
+        # Step 2.5: Polygon enrichment (conditional - only if include_polygons is enabled)
+        total_polygon_enrichment_time = 0
+        if include_polygons and document['extracted_data'].get('ocr_polygon_data'):
+            logger.info("Starting polygon enrichment")
+            polygon_data = document['extracted_data'].get('ocr_polygon_data', {})
+            
+            # Enrich each chunk's extraction with polygons
+            if len(extracted_data_list) > 1:
+                enriched_with_polygons_list = []
+                for i, extracted_data in enumerate(extracted_data_list):
+                    # Use corresponding chunk's polygon data if available
+                    chunk_polygon_data = ocr_polygon_data_list[i] if i < len(ocr_polygon_data_list) else polygon_data
+                    enriched_data, enrichment_time = run_polygon_enrichment(
+                        extracted_data, chunk_polygon_data, document, data_container,
+                        threshold=fuzzy_match_threshold, update_state_flag=False
+                    )
+                    enriched_with_polygons_list.append(enriched_data)
+                    total_polygon_enrichment_time += enrichment_time
+                
+                structured_polygons = create_page_range_structure(
+                    enriched_with_polygons_list, file_paths, max_pages_per_chunk
+                )
+            else:
+                enriched_data, enrichment_time = run_polygon_enrichment(
+                    structured_extraction, polygon_data, document, data_container,
+                    threshold=fuzzy_match_threshold, update_state_flag=False
+                )
+                structured_polygons = enriched_data
+                total_polygon_enrichment_time = enrichment_time
+            
+            document['extracted_data']['gpt_extraction_output_with_polygons'] = structured_polygons
+            processing_times['polygon_enrichment_time'] = total_polygon_enrichment_time
+            logger.info(f"Completed polygon enrichment in {total_polygon_enrichment_time:.2f}s")
+        else:
+            document['extracted_data']['gpt_extraction_output_with_polygons'] = {}
+            processing_times['polygon_enrichment_time'] = 0
+        
         data_container.upsert_item(document)
 
         # Step 3: GPT evaluation (conditional)

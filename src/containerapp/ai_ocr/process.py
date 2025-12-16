@@ -158,6 +158,7 @@ from ai_ocr.azure.openai_ops import load_image, get_size_of_base64_images
 from ai_ocr.chains import get_structured_data, get_summary_with_gpt, perform_gpt_evaluation_and_enrichment
 from ai_ocr.model import Config
 from ai_ocr.azure.images import convert_pdf_into_image
+from ai_ocr.polygon_matcher import enrich_extraction_with_polygons
 
 def connect_to_cosmos():
     endpoint = os.environ['COSMOS_URL']
@@ -185,8 +186,16 @@ def initialize_document(file_name: str, file_size: int, num_pages:int, prompt: s
             "include_ocr": True,
             "include_images": True,
             "enable_summary": True,
-            "enable_evaluation": True
+            "enable_evaluation": True,
+            "include_polygons": False,
+            "fuzzy_match_threshold": 90.0
         }
+    else:
+        # Ensure polygon options have defaults
+        if "include_polygons" not in processing_options:
+            processing_options["include_polygons"] = False
+        if "fuzzy_match_threshold" not in processing_options:
+            processing_options["fuzzy_match_threshold"] = 90.0
     
     return {
         "id": file_name.replace('/', '__'),
@@ -208,8 +217,10 @@ def initialize_document(file_name: str, file_size: int, num_pages:int, prompt: s
         },
         "extracted_data": {
             "ocr_output": '',
+            "ocr_polygon_data": {},
             "gpt_extraction_output": {},
             "gpt_extraction_output_with_evaluation": {},
+            "gpt_extraction_output_with_polygons": {},
             "gpt_summary_output": ''
         },
         "model_input":{
@@ -390,13 +401,21 @@ def fetch_model_prompt_and_schema(dataset_type, force_refresh=False):
     example_schema = datasets_config[dataset_type]['example_schema']
     max_pages_per_chunk = datasets_config[dataset_type].get('max_pages_per_chunk', 10)  # Default to 10 for backward compatibility
     
-    # Get processing options with defaults
+    # Get processing options with defaults (including polygon options)
     processing_options = datasets_config[dataset_type].get('processing_options', {
         "include_ocr": True,
         "include_images": True,
         "enable_summary": True,
-        "enable_evaluation": True
+        "enable_evaluation": True,
+        "include_polygons": False,
+        "fuzzy_match_threshold": 90.0
     })
+    
+    # Ensure polygon options have defaults for backward compatibility
+    if "include_polygons" not in processing_options:
+        processing_options["include_polygons"] = False
+    if "fuzzy_match_threshold" not in processing_options:
+        processing_options["fuzzy_match_threshold"] = 90.0
     
     return model_prompt, example_schema, max_pages_per_chunk, processing_options
 
@@ -443,31 +462,54 @@ def convert_pdf_into_image(pdf_path):
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise e
 
-def run_ocr_processing(file_to_ocr: str, document: dict, container: any, conf_container: any = None, update_state: bool = True) -> tuple[str, float]:
+def run_ocr_processing(file_to_ocr: str, document: dict, container: any, conf_container: any = None, update_state: bool = True, include_polygons: bool = False) -> tuple[any, float]:
     """
     Run OCR processing on the input file using the configured OCR provider.
-    Returns OCR result and processing time.
+    
+    Args:
+        file_to_ocr: Path to the file to process
+        document: Document dictionary for state updates
+        container: Cosmos DB container for state updates
+        conf_container: Optional config container
+        update_state: Whether to update document state
+        include_polygons: Whether to include polygon data in OCR results
+        
+    Returns:
+        Tuple of (OCR result, processing time)
+        - If include_polygons=False: OCR result is a string
+        - If include_polygons=True: OCR result is a dict with 'content' and polygon data
     """
     ocr_start_time = datetime.now()
     try:
         # Get the OCR provider from environment variable (solution-level setting)
         ocr_provider = os.getenv('OCR_PROVIDER', 'azure').lower()
         
-        logging.info(f"Using OCR provider: {ocr_provider}")
+        logging.info(f"Using OCR provider: {ocr_provider}, include_polygons: {include_polygons}")
         
         # Select the appropriate OCR function
         if ocr_provider == 'mistral':
-            ocr_result = get_mistral_ocr_results(file_to_ocr, None)
+            ocr_result = get_mistral_ocr_results(file_to_ocr, None, include_polygons=include_polygons)
         elif ocr_provider == 'azure':
-            ocr_result = get_azure_ocr_results(file_to_ocr, None)
+            ocr_result = get_azure_ocr_results(file_to_ocr, None, include_polygons=include_polygons)
         else:
             raise ValueError(f"Unknown OCR provider: {ocr_provider}. Supported providers: 'azure', 'mistral'")
         
         # Don't update document's ocr_output here for chunks - let caller handle merging
         ocr_processing_time = (datetime.now() - ocr_start_time).total_seconds()
         if update_state:
-            document['extracted_data']['ocr_output'] = ocr_result
+            # Store appropriate OCR output based on polygon mode
+            if include_polygons and isinstance(ocr_result, dict):
+                document['extracted_data']['ocr_output'] = ocr_result.get('content', '')
+                document['extracted_data']['ocr_polygon_data'] = {
+                    'words': ocr_result.get('words', []),
+                    'lines': ocr_result.get('lines', []),
+                    'keyValuePairs': ocr_result.get('keyValuePairs', []),
+                    'paragraphs': ocr_result.get('paragraphs', [])
+                }
+            else:
+                document['extracted_data']['ocr_output'] = ocr_result
             document['properties']['ocr_provider_used'] = ocr_provider
+            document['properties']['include_polygons'] = include_polygons
             update_state(document, container, 'ocr_completed', True, ocr_processing_time)
         return ocr_result, ocr_processing_time
     except Exception as e:
@@ -572,6 +614,66 @@ def run_gpt_extraction(ocr_result: str, prompt: str, json_schema: str, imgs: lis
         if update_state:
             update_state(document, container, 'gpt_extraction_completed', False)
         raise e
+
+
+def run_polygon_enrichment(
+    extracted_data: dict, 
+    polygon_data: dict, 
+    document: dict, 
+    container: any, 
+    threshold: float = 90.0,
+    update_state_flag: bool = True
+) -> tuple[dict, float]:
+    """
+    Enrich GPT-extracted data with bounding polygon information.
+    
+    Args:
+        extracted_data: The extracted JSON data from GPT
+        polygon_data: Full polygon data from Document Intelligence
+        document: Document dictionary for state updates
+        container: Cosmos DB container for state updates
+        threshold: Fuzzy matching threshold (0-100)
+        update_state_flag: Whether to update document state
+        
+    Returns:
+        Tuple of (enriched data with polygons, processing time)
+    """
+    enrichment_start_time = datetime.now()
+    try:
+        logging.info(f"Starting polygon enrichment with threshold {threshold}%")
+        
+        # Check if we have valid data to enrich
+        if not extracted_data or not polygon_data:
+            logging.warning("Missing extracted_data or polygon_data for enrichment")
+            return extracted_data, 0.0
+        
+        # Skip enrichment if extraction failed
+        if isinstance(extracted_data, dict) and ("error" in extracted_data or "extraction_failed" in extracted_data):
+            logging.warning("Skipping polygon enrichment due to extraction errors")
+            return extracted_data, 0.0
+        
+        # Perform polygon correlation
+        enriched_data = enrich_extraction_with_polygons(
+            extracted_data=extracted_data,
+            polygon_data=polygon_data,
+            threshold=threshold
+        )
+        
+        enrichment_time = (datetime.now() - enrichment_start_time).total_seconds()
+        
+        if update_state_flag:
+            document['extracted_data']['gpt_extraction_output_with_polygons'] = enriched_data
+            logging.info(f"Polygon enrichment completed in {enrichment_time:.2f}s")
+        
+        return enriched_data, enrichment_time
+        
+    except Exception as e:
+        logging.error(f"Polygon enrichment error: {str(e)}")
+        import traceback
+        logging.error(f"Traceback: {traceback.format_exc()}")
+        document['errors'].append(f"Polygon enrichment error: {str(e)}")
+        # Return original data without polygons on error
+        return extracted_data, 0.0
 
 def run_gpt_evaluation(imgs: list, extracted_data: dict, json_schema: str, 
                       document: dict, container: any, conf_container: any = None, update_state: bool = True) -> tuple[dict, float]:
