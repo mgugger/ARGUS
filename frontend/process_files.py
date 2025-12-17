@@ -178,7 +178,8 @@ def process_files_tab():
                 "include_ocr": True,
                 "include_images": True,
                 "enable_summary": True,
-                "enable_evaluation": True
+                "enable_evaluation": True,
+                "include_polygons": False
             })
 
             st.session_state.system_prompt = st.text_area("Model Prompt", value=model_prompt, height=150)
@@ -226,13 +227,20 @@ def process_files_tab():
                     value=processing_options.get("enable_evaluation", True),
                     help="Perform additional quality checks and validation on the extracted data using advanced AI evaluation. This includes confidence scoring, data completeness analysis, and enrichment suggestions. Helps ensure the extracted information is accurate and complete, especially important for critical business documents."
                 )
+                
+                include_polygons = st.checkbox(
+                    "📍 Include Bounding Polygons", 
+                    value=processing_options.get("include_polygons", False),
+                    help="Include bounding polygon coordinates for each extracted field. This enables precise location tracking of where each piece of data appears in the original document. Useful for document verification, highlighting extracted values, and building document annotation features."
+                )
             
             # Store processing options in session state
             st.session_state.processing_options = {
                 "include_ocr": include_ocr,
                 "include_images": include_images,
                 "enable_summary": enable_summary,
-                "enable_evaluation": enable_evaluation
+                "enable_evaluation": enable_evaluation,
+                "include_polygons": include_polygons
             }
             
             # Show cost/performance impact
@@ -301,6 +309,8 @@ def process_files_tab():
             with col_new_b:
                 new_enable_summary = st.checkbox("📋 Generate Summary", value=True, key="new_summary")
                 new_enable_evaluation = st.checkbox("🔍 Enable Evaluation", value=True, key="new_evaluation")
+                new_include_polygons = st.checkbox("📍 Include Polygons", value=False, key="new_polygons",
+                                                   help="Include bounding polygon coordinates for extracted fields.")
 
             if st.button('Add New Dataset'):
                 if new_dataset_name and new_dataset_name not in config_data.get("datasets", {}):
@@ -319,7 +329,8 @@ def process_files_tab():
                                 "include_ocr": new_include_ocr,
                                 "include_images": new_include_images,
                                 "enable_summary": new_enable_summary,
-                                "enable_evaluation": new_enable_evaluation
+                                "enable_evaluation": new_enable_evaluation,
+                                "include_polygons": new_include_polygons
                             }
                         }
                         update_configuration(config_data)
@@ -359,9 +370,15 @@ def process_files_tab():
                - ✅ *Enable*: Generate document summary 
                - ❌ *Disable*: Skip summary generation (faster, lower cost)
             
+            6. **📍 Bounding Polygons** (Optional)
+               - ✅ *Enable*: Include bounding polygon coordinates for each extracted field
+               - ❌ *Disable*: Skip polygon extraction (faster processing)
+               - Useful for document annotation, highlighting extracted values, and verification workflows
+            
             **Cost & Performance Impact:**
             - Disabling OCR saves on Document Intelligence costs when you only need visual analysis
             - Each enabled option adds GPT API calls and processing time
+            - Enabling Bounding Polygons requires OCR to be enabled for coordinate extraction
             - **Recommended for testing**: Enable all options for best results
             - **Recommended for production**: Customize based on your specific needs
             - **For cost optimization**: Disable evaluation and summary if not needed

@@ -374,7 +374,7 @@ resource frontendContainerApp 'Microsoft.App/containerApps@2024-03-01' = {
     configuration: {
       ingress: {
         external: true
-        targetPort: 3000
+        targetPort: 8501
         corsPolicy: {
           allowedOrigins: ['*']
           allowedMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']

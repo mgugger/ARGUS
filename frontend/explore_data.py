@@ -801,7 +801,7 @@ def explore_data_tab():
                 # Document data column
                 with json_col:
                     if json_data:
-                        tabs = st.tabs(["GPT Extraction", "OCR Extraction", "GPT Evaluation", "GPT Summary", "Processing Details", "Correction History", "Chat with Document"])
+                        tabs = st.tabs(["GPT Extraction", "OCR Extraction", "GPT Evaluation", "GPT Summary", "Polygon Data", "Processing Details", "Correction History", "Chat with Document"])
                         
                         # GPT Extraction Tab - with Human-in-the-Loop Correction
                         with tabs[0]:
@@ -967,8 +967,74 @@ def explore_data_tab():
                             except Exception as e:
                                 st.warning(f"Error displaying summary: {str(e)}")
                         
-                        # Processing Details Tab
+                        # Polygon Data Tab
                         with tabs[4]:
+                            try:
+                                extracted_data = json_data.get('extracted_data', {})
+                                ocr_polygon_data = extracted_data.get('ocr_polygon_data', {})
+                                gpt_extraction_with_polygons = extracted_data.get('gpt_extraction_output_with_polygons', {})
+                                
+                                # Check if polygon data is available
+                                has_ocr_polygons = ocr_polygon_data and len(ocr_polygon_data) > 0
+                                has_gpt_polygons = gpt_extraction_with_polygons and len(gpt_extraction_with_polygons) > 0
+                                
+                                if not has_ocr_polygons and not has_gpt_polygons:
+                                    st.warning("📍 No polygon data available for this document.")
+                                    st.info("""**To enable polygon extraction:**
+1. Go to **Process Files** tab
+2. Select your dataset
+3. Enable **📍 Include Bounding Polygons** in Processing Options
+4. Save the configuration
+5. Re-process the document""")
+                                else:
+                                    # Create sub-tabs for different polygon data views
+                                    polygon_tabs = st.tabs(["GPT Extraction with Polygons", "OCR Polygon Data"])
+                                    
+                                    with polygon_tabs[0]:
+                                        if has_gpt_polygons:
+                                            st.success("✅ GPT extraction with polygon data available")
+                                            st.download_button(
+                                                label="📥 Download GPT Extraction with Polygons",
+                                                data=json.dumps(gpt_extraction_with_polygons, indent=2),
+                                                file_name="gpt_extraction_with_polygons.json",
+                                                mime="application/json",
+                                                key=f"download_gpt_polygons_{json_item_id}"
+                                            )
+                                            st.json(gpt_extraction_with_polygons)
+                                        else:
+                                            st.warning("GPT extraction with polygons not available")
+                                    
+                                    with polygon_tabs[1]:
+                                        if has_ocr_polygons:
+                                            st.success("✅ OCR polygon data available")
+                                            
+                                            # Show summary stats
+                                            words_count = len(ocr_polygon_data.get('words', []))
+                                            lines_count = len(ocr_polygon_data.get('lines', []))
+                                            kv_pairs_count = len(ocr_polygon_data.get('keyValuePairs', []))
+                                            
+                                            col1, col2, col3 = st.columns(3)
+                                            col1.metric("Words", words_count)
+                                            col2.metric("Lines", lines_count)
+                                            col3.metric("Key-Value Pairs", kv_pairs_count)
+                                            
+                                            st.download_button(
+                                                label="📥 Download OCR Polygon Data",
+                                                data=json.dumps(ocr_polygon_data, indent=2),
+                                                file_name="ocr_polygon_data.json",
+                                                mime="application/json",
+                                                key=f"download_ocr_polygons_{json_item_id}"
+                                            )
+                                            
+                                            with st.expander("View Full OCR Polygon Data", expanded=False):
+                                                st.json(ocr_polygon_data)
+                                        else:
+                                            st.warning("OCR polygon data not available")
+                            except Exception as e:
+                                st.warning(f"Error displaying polygon data: {str(e)}")
+                        
+                        # Processing Details Tab
+                        with tabs[5]:
                             try:
                                 properties = json_data.get('properties', {})
                                 state = json_data.get('state', {})
@@ -1002,7 +1068,7 @@ def explore_data_tab():
                                 st.warning(f"Some details are not available: {str(e)}")
                         
                         # Correction History Tab
-                        with tabs[5]:
+                        with tabs[6]:
                             try:
                                 correction_history = get_correction_history_from_cosmosdb(json_item_id)
                                 
@@ -1058,7 +1124,7 @@ def explore_data_tab():
                                 st.warning(f"Error loading correction history: {str(e)}")
                         
                         # Chat with Document Tab
-                        with tabs[6]:
+                        with tabs[7]:
                             try:
                                 # Import the chat component
                                 from document_chat import render_document_chat_tab
