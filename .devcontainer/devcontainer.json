@@ -3,7 +3,12 @@
     "features": {
       "ghcr.io/devcontainers/features/azure-cli:1": {},
       "ghcr.io/azure/azure-dev/azd:0": {},
-      "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+      "ghcr.io/devcontainers/features/docker-in-docker:2": {
+          "moby": false,
+          "version": "latest",
+          "dockerDashComposeVersion": "v2",
+          "disableIP6Tables": false
+        }
     },
     "customizations": {
       "vscode": {
